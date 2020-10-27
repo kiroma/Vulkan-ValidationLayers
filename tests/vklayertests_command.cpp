@@ -7251,7 +7251,8 @@ TEST_F(VkLayerTest, InvalidMixingProtectedResources) {
     buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer_create_info.pNext = nullptr;
     buffer_create_info.size = 1 << 20;  // 1 MB
-    buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    buffer_create_info.usage =
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     buffer_create_info.flags = VK_BUFFER_CREATE_PROTECTED_BIT;
@@ -7262,7 +7263,10 @@ TEST_F(VkLayerTest, InvalidMixingProtectedResources) {
     // Create actual protected and unprotected images
     VkImageObj image_protected(m_device);
     VkImageObj image_unprotected(m_device);
+    VkImageObj image_protected_descriptor(m_device);
+    VkImageObj image_unprotected_descriptor(m_device);
     VkImageView image_views[2];
+    VkImageView image_views_descriptor[2];
     VkImageCreateInfo image_create_info = {};
     image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     image_create_info.pNext = nullptr;
@@ -7270,8 +7274,8 @@ TEST_F(VkLayerTest, InvalidMixingProtectedResources) {
     image_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
     image_create_info.imageType = VK_IMAGE_TYPE_2D;
     image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image_create_info.usage =
-        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
     image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_create_info.arrayLayers = 1;
     image_create_info.mipLevels = 1;
@@ -7281,10 +7285,18 @@ TEST_F(VkLayerTest, InvalidMixingProtectedResources) {
     image_protected.SetLayout(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     image_views[0] = image_protected.targetView(VK_FORMAT_R8G8B8A8_UNORM);
 
+    image_protected_descriptor.init_no_mem(*m_device, image_create_info);
+    image_protected_descriptor.SetLayout(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    image_views_descriptor[0] = image_protected_descriptor.targetView(VK_FORMAT_R8G8B8A8_UNORM);
+
     image_create_info.flags = 0;
     image_unprotected.init_no_mem(*m_device, image_create_info);
     image_unprotected.SetLayout(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     image_views[1] = image_unprotected.targetView(VK_FORMAT_R8G8B8A8_UNORM);
+
+    image_unprotected_descriptor.init_no_mem(*m_device, image_create_info);
+    image_unprotected_descriptor.SetLayout(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    image_views_descriptor[1] = image_unprotected_descriptor.targetView(VK_FORMAT_R8G8B8A8_UNORM);
 
     // Create protected and unproteced memory
     VkDeviceMemory memory_protected = VK_NULL_HANDLE;
@@ -7401,7 +7413,37 @@ TEST_F(VkLayerTest, InvalidMixingProtectedResources) {
                                               {VK_IMAGE_ASPECT_COLOR_BIT, 1, {m_clear_color}}};
     VkClearRect clear_rect[2] = {{render_area, 0, 1}, {render_area, 0, 1}};
 
+    const char fsSource[] =
+        "#version 450\n"
+        "layout(set=0, binding=0) uniform foo { int x; int y; } bar;\n"
+        "layout(set=0, binding=1, rgba8) uniform image2D si1;\n"
+        "layout(location=0) out vec4 x;\n"
+        "void main(){\n"
+        "   x = vec4(bar.y);\n"
+        "   imageStore(si1, ivec2(0), vec4(0));\n"
+        "}\n";
+    VkShaderObj fs(m_device, fsSource, VK_SHADER_STAGE_FRAGMENT_BIT, this);
+
+    CreatePipelineHelper g_pipe(*this);
+    g_pipe.InitInfo();
+    g_pipe.gp_ci_.renderPass = render_pass;
+    g_pipe.shader_stages_ = {g_pipe.vs_->GetStageCreateInfo(), fs.GetStageCreateInfo()};
+    g_pipe.dsl_bindings_ = {{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    g_pipe.InitState();
+    ASSERT_VK_SUCCESS(g_pipe.CreateGraphicsPipeline());
+
+    VkSampler sampler;
+    VkSamplerCreateInfo sampler_ci = SafeSaneSamplerCreateInfo();
+    VkResult err = vk::CreateSampler(m_device->device(), &sampler_ci, nullptr, &sampler);
+    ASSERT_VK_SUCCESS(err);
+
     // Use protected resources in unprotected command buffer
+    g_pipe.descriptor_set_->WriteDescriptorBufferInfo(0, buffer_protected, 1024);
+    g_pipe.descriptor_set_->WriteDescriptorImageInfo(1, image_views_descriptor[0], sampler, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    g_pipe.descriptor_set_->UpdateDescriptorSets();
+
     m_commandBuffer->begin();
 
     m_errorMonitor->SetDesiredFailureMsg(kErrorBit, "VUID-vkCmdBlitImage-commandBuffer-01834");
@@ -7471,10 +7513,22 @@ TEST_F(VkLayerTest, InvalidMixingProtectedResources) {
     vk::CmdClearAttachments(m_commandBuffer->handle(), 2, clear_attachments, 2, clear_rect);
     m_errorMonitor->VerifyFound();
 
+    vk::CmdBindPipeline(m_commandBuffer->handle(), VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe.pipeline_);
+    vk::CmdBindDescriptorSets(m_commandBuffer->handle(), VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe.pipeline_layout_.handle(), 0, 1,
+                              &g_pipe.descriptor_set_->set_, 0, nullptr);
+
+    m_errorMonitor->SetDesiredFailureMsg(kErrorBit, "VUID-vkCmdDraw-commandBuffer-02712");
+    vk::CmdDraw(m_commandBuffer->handle(), 1, 0, 0, 0);
+    m_errorMonitor->VerifyFound();
+
     vk::CmdEndRenderPass(m_commandBuffer->handle());
     m_commandBuffer->end();
 
     // Use unprotected resources in protected command buffer
+    g_pipe.descriptor_set_->WriteDescriptorBufferInfo(0, buffer_unprotected, 1024);
+    g_pipe.descriptor_set_->WriteDescriptorImageInfo(1, image_views_descriptor[1], sampler);
+    g_pipe.descriptor_set_->UpdateDescriptorSets();
+
     protectedCommandBuffer.begin();
 
     m_errorMonitor->SetDesiredFailureMsg(kErrorBit, "VUID-vkCmdBlitImage-commandBuffer-01836");
@@ -7518,6 +7572,15 @@ TEST_F(VkLayerTest, InvalidMixingProtectedResources) {
 
     m_errorMonitor->SetDesiredFailureMsg(kErrorBit, "VUID-vkCmdClearAttachments-commandBuffer-02505");
     vk::CmdClearAttachments(protectedCommandBuffer.handle(), 2, clear_attachments, 2, clear_rect);
+    m_errorMonitor->VerifyFound();
+
+    vk::CmdBindPipeline(protectedCommandBuffer.handle(), VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe.pipeline_);
+    vk::CmdBindDescriptorSets(protectedCommandBuffer.handle(), VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe.pipeline_layout_.handle(), 0,
+                              1, &g_pipe.descriptor_set_->set_, 0, nullptr);
+
+    m_errorMonitor->SetDesiredFailureMsg(kErrorBit, "VUID-vkCmdDraw-commandBuffer-02707");
+    m_errorMonitor->SetDesiredFailureMsg(kErrorBit, "VUID-vkCmdDraw-commandBuffer-02707");
+    vk::CmdDraw(protectedCommandBuffer.handle(), 1, 0, 0, 0);
     m_errorMonitor->VerifyFound();
 
     vk::CmdEndRenderPass(protectedCommandBuffer.handle());
@@ -7848,6 +7911,72 @@ TEST_F(VkLayerTest, VerifyDynamicStateSettingCommands) {
 
     m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "VUID-vkCmdDraw-None-02859");
     vk::CmdDraw(m_commandBuffer->handle(), 1, 0, 0, 0);
+    m_errorMonitor->VerifyFound();
+
+    m_commandBuffer->EndRenderPass();
+    m_commandBuffer->end();
+}
+
+TEST_F(VkLayerTest, VerifyFilterCubicSamplerInCmdDraw) {
+    TEST_DESCRIPTION("Verify if sampler is filter cubic, image view needs to support it.");
+    ASSERT_NO_FATAL_FAILURE(Init());
+    ASSERT_NO_FATAL_FAILURE(InitRenderTarget());
+
+    m_errorMonitor->ExpectSuccess();
+
+    m_errorMonitor->VerifyNotFound();
+}
+
+TEST_F(VkLayerTest, VerifyMaxMultiviewInstanceIndex) {
+    TEST_DESCRIPTION("Verify if instance index in CmdDraw is greater than maxMultiviewInstanceIndex.");
+    uint32_t version = SetTargetApiVersion(VK_API_VERSION_1_1);
+    if (version < VK_API_VERSION_1_1) {
+        printf("%s At least Vulkan version 1.1 is required, skipping test.\n", kSkipPrefix);
+        return;
+    }
+    if (InstanceExtensionSupported(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
+        m_instance_extension_names.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    } else {
+        printf("%s Did not find required instance extension %s; skipped.\n", kSkipPrefix,
+               VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+        return;
+    }
+    ASSERT_NO_FATAL_FAILURE(InitFramework(m_errorMonitor));
+
+    if (DeviceExtensionSupported(gpu(), nullptr, VK_KHR_MULTIVIEW_EXTENSION_NAME)) {
+        m_device_extension_names.push_back(VK_KHR_MULTIVIEW_EXTENSION_NAME);
+    } else {
+        printf("%s %s Extension not supported, skipping tests\n", kSkipPrefix, VK_KHR_MULTIVIEW_EXTENSION_NAME);
+        return;
+    }
+
+    auto multiview_features = lvl_init_struct<VkPhysicalDeviceMultiviewFeatures>();
+    multiview_features.multiview = VK_TRUE;
+    VkPhysicalDeviceFeatures2 pd_features2 = {};
+    pd_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    pd_features2.pNext = &multiview_features;
+
+    ASSERT_NO_FATAL_FAILURE(InitState(nullptr, &pd_features2));
+    ASSERT_NO_FATAL_FAILURE(InitRenderTarget());
+
+    PFN_vkGetPhysicalDeviceProperties2KHR vkGetPhysicalDeviceProperties2KHR =
+        (PFN_vkGetPhysicalDeviceProperties2KHR)vk::GetInstanceProcAddr(instance(), "vkGetPhysicalDeviceProperties2KHR");
+    ASSERT_TRUE(vkGetPhysicalDeviceProperties2KHR != nullptr);
+    auto multiview_props = lvl_init_struct<VkPhysicalDeviceMultiviewProperties>();
+    VkPhysicalDeviceProperties2KHR properties2 = lvl_init_struct<VkPhysicalDeviceProperties2KHR>(&multiview_props);
+    vkGetPhysicalDeviceProperties2KHR(gpu(), &properties2);
+
+    CreatePipelineHelper pipe(*this);
+    pipe.InitInfo();
+    pipe.InitState();
+    pipe.CreateGraphicsPipeline();
+
+    m_commandBuffer->begin();
+    m_commandBuffer->BeginRenderPass(m_renderPassBeginInfo);
+    vk::CmdBindPipeline(m_commandBuffer->handle(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.pipeline_);
+
+    m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "VUID-vkCmdDraw-maxMultiviewInstanceIndex-02688");
+    m_commandBuffer->Draw(1, multiview_props.maxMultiviewInstanceIndex + 1, 0, 0);
     m_errorMonitor->VerifyFound();
 
     m_commandBuffer->EndRenderPass();
